@@ -1,62 +1,188 @@
-# [HOME COMPUTER VERSION] 蝦皮評論影片下載 + Gemini過濾 + 合併
-# 從選品Excel → 抓每個商品評論區影片 → Gemini篩掉人臉/開箱 → 湊3支合一
-# 建立在 video_filter.py (Gemini) + shopee_keyword_scraper.py (CDP) 基礎上
+# 蝦皮選品影片製作 - Home Computer Version
+# 讀取選品Excel → 抓評論影片 → Gemini篩(無人臉/無開箱) → 合併3支 → 加文案字幕 + BGM → 輸出
 
-import sys, io, asyncio, json, re, os, random, requests, time, tempfile, shutil
+import sys, io, asyncio, json, re, os, random, requests, time, tempfile, shutil, glob
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import cv2
-import warnings
-warnings.filterwarnings('ignore')
+import warnings; warnings.filterwarnings('ignore')
 import google.generativeai as genai
 import openpyxl
+from PIL import Image, ImageDraw, ImageFont
 from playwright.async_api import async_playwright
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy import VideoFileClip, AudioFileClip, ImageClip, concatenate_videoclips, CompositeVideoClip
 import imageio_ffmpeg
+import numpy as np
 
-# ── Config ────────────────────────────────────────────────────────────────────
-EXCEL_PATH   = r'C:\Users\user\Desktop\蝦皮關鍵字選品_2026年3-4月.xlsx'
-OUTPUT_DIR   = r'C:\Users\user\Desktop\蝦皮選品影片'
-GEMINI_KEY   = 'AIzaSyBfhyW5K3TrNZHs5380tBQ2KjabCmXHtW'  # same as video_filter.py
+# ── 路徑設定 ──────────────────────────────────────────────────────────────────
+BASE_DIR   = r'C:\Users\user\Desktop\蝦皮自動化工具'
+EXCEL_PATH = os.path.join(BASE_DIR, r'選品Excel\蝦皮關鍵字選品_2026年3-4月.xlsx')
+OUTPUT_DIR = os.path.join(BASE_DIR, '影片輸出')
+BGM_DIR    = os.path.join(BASE_DIR, 'BGM音樂')
+FONT_PATH  = r'C:\Windows\Fonts\msjh.ttc'    # 微軟正黑體（支援繁體中文）
 
-MIN_CLIPS    = 3    # 每個商品最少要幾支影片才合併
-MAX_TRY      = 15   # 每個商品最多試幾支評論影片
-RATINGS_LIMIT = 10  # 每頁抓幾筆評論
-TARGET_SEC   = 18   # 合併後目標秒數
-
+# ── 欄位對應（依照實際Excel）─────────────────────────────────────────────────
 COL_NAME   = 1   # A: 品名
-COL_LINK   = 2   # B: 分潤連結 (含 shop_id / item_id)
-COL_STATUS = 8   # H: 狀態
+COL_LINK   = 2   # B: 分潤連結
+COL_COPY   = 7   # G: 文案
+COL_TITLE  = 8   # H: 標題
+COL_STATUS = 9   # I: 狀態  ← 注意是第9欄
 
-FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+# ── 影片參數 ──────────────────────────────────────────────────────────────────
+MIN_CLIPS    = 3    # 最少幾支影片才合併
+MAX_TRY      = 15   # 每個商品最多試幾支評論影片
+TARGET_SEC   = 18   # 合併後目標秒數
+VIDEO_W      = 1080
+VIDEO_H      = 1920
 
-# ── Gemini 初始化 (沿用 video_filter.py 設定) ─────────────────────────────────
+# ── Gemini 設定 ───────────────────────────────────────────────────────────────
+GEMINI_KEY = 'AIzaSyBfhyW5K3TrNZHs5380tBQ2KjabCmXHtW'
 genai.configure(api_key=GEMINI_KEY, client_options={'api_version': 'v1'})
 gemini = genai.GenerativeModel(model_name='gemini-1.5-flash')
 
-# ── 工具函式 ──────────────────────────────────────────────────────────────────
-def extract_ids(url):
-    """從商品連結抓出 shop_id, item_id"""
-    s = str(url or '')
-    m = re.search(r'/product/(\d+)/(\d+)', s)
-    if m: return m.group(1), m.group(2)
-    m = re.search(r'-i\.(\d+)\.(\d+)', s)
-    if m: return m.group(1), m.group(2)
-    return None, None
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 文字工具
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def wrap_text(text, font, max_width, draw):
+    """自動換行，回傳 list of lines"""
+    if not text: return []
+    lines, current = [], ''
+    for ch in str(text):
+        test = current + ch
+        w = draw.textlength(test, font=font)
+        if w > max_width and current:
+            lines.append(current)
+            current = ch
+        else:
+            current = test
+    if current: lines.append(current)
+    return lines
+
+def make_text_overlay(text, video_w, video_h, duration,
+                      font_size=52, y_pos='bottom', bg_alpha=160):
+    """
+    用 PIL 渲染文字，回傳 moviepy ImageClip（透明背景疊在影片上）
+    y_pos: 'top' | 'bottom' | 'center'
+    """
+    try:
+        font = ImageFont.truetype(FONT_PATH, font_size)
+    except:
+        font = ImageFont.load_default()
+
+    # 計算文字區域
+    margin = 40
+    max_w  = video_w - margin * 2
+    dummy  = ImageDraw.Draw(Image.new('RGBA', (1, 1)))
+    lines  = wrap_text(text, font, max_w, dummy)
+    if not lines: return None
+
+    line_h   = font_size + 12
+    box_h    = line_h * len(lines) + margin
+    box_w    = video_w
+
+    img = Image.new('RGBA', (box_w, box_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # 半透明黑底
+    draw.rectangle([0, 0, box_w, box_h], fill=(0, 0, 0, bg_alpha))
+
+    # 文字
+    for i, line in enumerate(lines):
+        w = draw.textlength(line, font=font)
+        x = (box_w - w) // 2
+        y = margin // 2 + i * line_h
+        # 陰影
+        draw.text((x+2, y+2), line, font=font, fill=(0, 0, 0, 200))
+        draw.text((x, y), line, font=font, fill=(255, 255, 255, 255))
+
+    arr = np.array(img)
+
+    if y_pos == 'bottom':
+        pos_y = video_h - box_h - 60
+    elif y_pos == 'top':
+        pos_y = 60
+    else:
+        pos_y = (video_h - box_h) // 2
+
+    clip = (ImageClip(arr, transparent=True)
+            .with_duration(duration)
+            .with_position(('center', pos_y)))
+    return clip
+
+
+def make_title_card(title, copy_text, duration=2.5):
+    """開頭標題卡（黑底白字）"""
+    img = Image.new('RGB', (VIDEO_W, VIDEO_H), (10, 10, 10))
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font_big  = ImageFont.truetype(FONT_PATH, 64)
+        font_small = ImageFont.truetype(FONT_PATH, 40)
+    except:
+        font_big = font_small = ImageFont.load_default()
+
+    # 標題
+    if title:
+        lines = wrap_text(str(title), font_big, VIDEO_W - 80, draw)
+        total_h = len(lines) * 80
+        start_y = (VIDEO_H - total_h) // 2 - 60
+        for i, line in enumerate(lines):
+            w = draw.textlength(line, font=font_big)
+            draw.text(((VIDEO_W - w)//2 + 2, start_y + i*80 + 2), line,
+                      font=font_big, fill=(0,0,0))
+            draw.text(((VIDEO_W - w)//2, start_y + i*80), line,
+                      font=font_big, fill=(255,255,255))
+
+    arr = np.array(img)
+    return ImageClip(arr).with_duration(duration)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BGM 工具
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_bgm(video_duration):
+    """
+    從 BGM音樂 資料夾隨機選一首，裁切/循環到指定秒數
+    沒有音樂就回傳 None
+    """
+    exts = ['*.mp3', '*.wav', '*.m4a', '*.aac']
+    music_files = []
+    for ext in exts:
+        music_files += glob.glob(os.path.join(BGM_DIR, ext))
+    if not music_files:
+        return None
+    chosen = random.choice(music_files)
+    try:
+        audio = AudioFileClip(chosen)
+        # 如果音樂比影片短，循環
+        if audio.duration < video_duration:
+            loops = int(video_duration / audio.duration) + 1
+            import moviepy
+            from moviepy import concatenate_audioclips
+            audio = concatenate_audioclips([audio] * loops)
+        audio = audio.subclipped(0, video_duration).with_volume_scaled(0.4)
+        return audio
+    except Exception as e:
+        print(f'  [BGM] 載入失敗: {e}')
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Gemini 影片過濾
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def gemini_check_frame(img_path):
-    """
-    用 Gemini 檢查一張截圖，一次問兩件事：
-    1) 有無清楚人臉  2) 是否開箱影片（出現紙箱）
-    回傳 (has_face: bool, is_unboxing: bool)
-    """
+    """單張截圖：回傳 (has_face, is_unboxing)"""
     try:
         sample = genai.upload_file(path=img_path)
         resp = gemini.generate_content([
             sample,
-            "請回答以下兩個問題，每個只能回答「是」或「否」，\n"
-            "格式範例：否,否\n"
+            "請回答兩個問題，每個只能回答「是」或「否」，格式：答案1,答案2\n"
             "問題1：這張圖片中是否有清楚可辨識的人臉？\n"
             "問題2：這張圖片是否為開箱影片（有紙箱或包裝盒正在被拆開）？"
         ])
@@ -67,14 +193,10 @@ def gemini_check_frame(img_path):
         return face, unboxing
     except Exception as e:
         print(f'      [Gemini] {e}')
-        return False, False   # 判斷失敗就放行（寧可留著）
+        return False, False
 
 def is_valid_video(video_path):
-    """
-    抽 3 個時間點的截圖 → 送 Gemini 檢查
-    只要任何一張：有人臉 OR 是開箱 → 拒絕
-    全部通過 → 接受
-    """
+    """抽 3 個時間點截圖送 Gemini，任一有人臉或開箱就拒絕"""
     try:
         cap = cv2.VideoCapture(video_path)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -86,23 +208,26 @@ def is_valid_video(video_path):
             ok, frame = cap.read()
             if not ok: continue
 
-            tmp_img = video_path + f'_f{int(pct*100)}.jpg'
-            cv2.imwrite(tmp_img, frame)
-            face, unbox = gemini_check_frame(tmp_img)
-            if os.path.exists(tmp_img): os.remove(tmp_img)
+            tmp = video_path + f'_f{int(pct*100)}.jpg'
+            cv2.imwrite(tmp, frame)
+            face, unbox = gemini_check_frame(tmp)
+            if os.path.exists(tmp): os.remove(tmp)
 
             if face:
-                print(f'      X 人臉 @{int(pct*100)}%')
-                cap.release(); return False
+                print(f' X 人臉@{int(pct*100)}%'); cap.release(); return False
             if unbox:
-                print(f'      X 開箱 @{int(pct*100)}%')
-                cap.release(); return False
+                print(f' X 開箱@{int(pct*100)}%'); cap.release(); return False
 
         cap.release()
         return True
     except Exception as e:
-        print(f'      [valid_check] {e}')
+        print(f'  [valid_check] {e}')
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 影片下載
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def download_video(url, dest):
     try:
@@ -112,55 +237,123 @@ def download_video(url, dest):
         r.raise_for_status()
         with open(dest, 'wb') as f:
             for chunk in r.iter_content(65536): f.write(chunk)
-        size = os.path.getsize(dest)
-        return size > 5000   # 至少 5KB 才算有效
+        return os.path.getsize(dest) > 5000
     except Exception as e:
-        print(f'      [download] {e}')
-        return False
+        print(f'  [download] {e}'); return False
 
-def merge_clips(clip_paths, output_path):
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 影片合併 + 後製（文案疊字 + BGM）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def resize_clip(clip):
+    """統一縮放到 1080x1920（直式），不足補黑邊"""
+    import subprocess, tempfile as tf
+    src  = clip.filename if hasattr(clip, 'filename') else None
+    if src is None: return clip
+
+    out = src + '_resized.mp4'
+    cmd = [
+        FFMPEG_EXE, '-y', '-i', src,
+        '-vf', f'scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=decrease,'
+               f'pad={VIDEO_W}:{VIDEO_H}:(ow-iw)/2:(oh-ih)/2:black',
+        '-c:v', 'libx264', '-an', '-preset', 'fast', '-loglevel', 'error', out
+    ]
+    subprocess.run(cmd, capture_output=True, timeout=120)
+    if os.path.exists(out):
+        return VideoFileClip(out)
+    return clip
+
+
+def produce_video(clip_paths, title, copy_text, output_path):
     """
-    用 moviepy v2 合併 3 支影片（去音訊），
-    輸出到 output_path
+    1. 合併 clip_paths（去音訊）
+    2. 疊上標題（開頭 3 秒）+ 文案（結尾滾動）
+    3. 加 BGM
+    4. 輸出 mp4
     """
     try:
+        # 1. 載入並 resize 影片片段
         clips = []
         for p in clip_paths[:MIN_CLIPS]:
             c = VideoFileClip(p).without_audio()
             clips.append(c)
 
-        final = concatenate_videoclips(clips, method='compose')
-        # 控制最長不超過 TARGET_SEC
-        if final.duration > TARGET_SEC:
-            final = final.subclipped(0, TARGET_SEC)
+        merged = concatenate_videoclips(clips, method='compose')
+        if merged.duration > TARGET_SEC:
+            merged = merged.subclipped(0, TARGET_SEC)
 
+        dur = merged.duration
+
+        # 2. 文字疊加
+        overlays = [merged]
+
+        if title:
+            title_overlay = make_text_overlay(
+                str(title), VIDEO_W, VIDEO_H, min(3.0, dur),
+                font_size=58, y_pos='top', bg_alpha=180
+            )
+            if title_overlay:
+                overlays.append(title_overlay)
+
+        if copy_text and str(copy_text).strip() not in ('文案', '', 'None'):
+            copy_overlay = make_text_overlay(
+                str(copy_text), VIDEO_W, VIDEO_H, dur,
+                font_size=46, y_pos='bottom', bg_alpha=170
+            )
+            if copy_overlay:
+                overlays.append(copy_overlay)
+
+        final = CompositeVideoClip(overlays, size=(VIDEO_W, VIDEO_H))
+
+        # 3. BGM
+        bgm = get_bgm(dur)
+        if bgm:
+            final = final.with_audio(bgm)
+            print(f'  BGM: 已加入')
+        else:
+            print(f'  BGM: 無音樂（可放 mp3 到 BGM音樂 資料夾）')
+
+        # 4. 輸出
         final.write_videofile(
-            output_path, codec='libx264', audio=False,
+            output_path,
+            codec='libx264',
+            audio_codec='aac',
+            fps=30,
             logger=None,
             ffmpeg_params=['-loglevel', 'error', '-preset', 'fast']
         )
         for c in clips: c.close()
+        merged.close()
         final.close()
         return True
     except Exception as e:
-        print(f'      [merge] {e}')
+        print(f'  [produce] {e}')
         return False
 
-# ── 評論影片 URL 抓取（CDP fetch on shopee.tw） ───────────────────────────────
-async def fetch_review_videos(page, shop_id, item_id):
-    """
-    呼叫 Shopee ratings API，回傳影片 URL 列表
-    用 CDP page.evaluate() 內的 fetch，自動帶入登入 session
-    """
-    video_urls = []
 
-    for offset in range(0, RATINGS_LIMIT * 30, RATINGS_LIMIT):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shopee ratings API（CDP fetch）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_ids(url):
+    s = str(url or '')
+    m = re.search(r'/product/(\d+)/(\d+)', s)
+    if m: return m.group(1), m.group(2)
+    m = re.search(r'-i\.(\d+)\.(\d+)', s)
+    if m: return m.group(1), m.group(2)
+    return None, None
+
+
+async def fetch_review_videos(page, shop_id, item_id):
+    video_urls = []
+    for offset in range(0, 10 * 30, 10):
         js = f"""
         (async () => {{
           try {{
             const r = await fetch(
               '/api/v2/item/get_ratings?itemid={item_id}&shopid={shop_id}' +
-              '&type=0&offset={offset}&limit={RATINGS_LIMIT}&filter=0',
+              '&type=0&offset={offset}&limit=10&filter=0',
               {{credentials: 'include'}}
             );
             return await r.json();
@@ -182,30 +375,33 @@ async def fetch_review_videos(page, shop_id, item_id):
                     url = m.get('url') or m.get('video_url') or ''
                     if url.startswith('http'): video_urls.append(url)
 
-        if len(ratings) < RATINGS_LIMIT: break   # 最後一頁
+        if len(ratings) < 10: break
         if len(video_urls) >= MAX_TRY: break
         await asyncio.sleep(0.3)
 
-    return list(dict.fromkeys(video_urls))[:MAX_TRY]  # deduplicate
+    return list(dict.fromkeys(video_urls))[:MAX_TRY]
 
-# ── 處理單一商品 ─────────────────────────────────────────────────────────────
-async def process_product(page, name, link, row_idx):
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 處理單一商品
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def process_product(page, row_data, row_idx):
+    name, link, copy_text, title = row_data
     shop_id, item_id = extract_ids(link)
     if not shop_id:
-        print(f'  X 無法解析 ID: {str(link)[:60]}')
+        print(f'  X 無法解析 ID')
         return '無法解析ID'
 
     print(f'  shop={shop_id}  item={item_id}')
 
-    # 如果目前頁面在驗證頁，先導到商品頁讓 session 生效
-    current_url = page.url
-    if 'captcha' in current_url or 'verify' in current_url:
-        await page.goto(f'https://shopee.tw', wait_until='domcontentloaded', timeout=15000)
+    # 確保頁面不在 captcha
+    if 'captcha' in page.url or 'verify' in page.url:
+        await page.goto('https://shopee.tw', wait_until='domcontentloaded', timeout=15000)
         await asyncio.sleep(2)
 
     video_urls = await fetch_review_videos(page, shop_id, item_id)
-    print(f'  評論影片 URL: {len(video_urls)} 個')
-
+    print(f'  評論影片: {len(video_urls)} 個')
     if not video_urls:
         return '無評論影片'
 
@@ -218,27 +414,22 @@ async def process_product(page, name, link, row_idx):
 
             dest = os.path.join(tmpdir, f'clip_{i:02d}.mp4')
             print(f'  [{i+1:2}/{len(video_urls)}] 下載...', end=' ', flush=True)
-
             if not download_video(url, dest):
-                print('失敗')
-                continue
+                print('失敗'); continue
 
             print('Gemini...', end=' ', flush=True)
             if is_valid_video(dest):
                 valid_clips.append(dest)
                 print(f'通過 ({len(valid_clips)}/{MIN_CLIPS})')
-            # 拒絕原因已在 is_valid_video 內印出
-
             time.sleep(0.5)
 
         print(f'  有效: {len(valid_clips)} / 需要: {MIN_CLIPS}')
 
         if len(valid_clips) >= MIN_CLIPS:
-            safe = re.sub(r'[\\/:*?"<>|]', '', str(name))[:35]
-            out  = os.path.join(OUTPUT_DIR, f'{row_idx:03d}_{safe}.mp4')
-            print(f'  合併 → {os.path.basename(out)} ...', end=' ', flush=True)
-            if merge_clips(valid_clips, out):
-                print('完成')
+            safe_name = re.sub(r'[\\/:*?"<>|]', '', str(name))[:35]
+            out_path  = os.path.join(OUTPUT_DIR, f'{row_idx:03d}_{safe_name}.mp4')
+            print(f'  後製 → {os.path.basename(out_path)}')
+            if produce_video(valid_clips, title, copy_text, out_path):
                 return '影片完成'
             else:
                 return '合併失敗'
@@ -248,13 +439,20 @@ async def process_product(page, name, link, row_idx):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ── 主程式 ────────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 主程式
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def main():
-    print('=' * 55)
-    print('蝦皮選品影片製作 - Home Computer Version')
-    print(f'輸出資料夾: {OUTPUT_DIR}')
-    print('篩選條件: 無人臉 / 無開箱 / 每品最少 3 支合併')
-    print('=' * 55)
+    print('=' * 60)
+    print('蝦皮選品影片製作 v2')
+    print(f'Excel : {EXCEL_PATH}')
+    print(f'輸出  : {OUTPUT_DIR}')
+    print(f'BGM   : {BGM_DIR}（放 mp3 進去就會自動加音樂）')
+    print('篩選  : 無人臉 / 無開箱 / 每品最少 3 支合併')
+    print('後製  : 標題疊字(上) + 文案疊字(下) + BGM')
+    print('=' * 60)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -279,27 +477,31 @@ async def main():
         for row in ws.iter_rows(min_row=2):
             name        = row[COL_NAME   - 1].value
             link        = row[COL_LINK   - 1].value
+            copy_text   = row[COL_COPY   - 1].value
+            title       = row[COL_TITLE  - 1].value
             status_cell = row[COL_STATUS - 1]
-            row_idx     = row[0].row - 1   # 1-based product index
+            row_idx     = row[0].row - 1
 
             if not name or not link: continue
             if status_cell.value in ('影片完成', '無評論影片'):
-                print(f'[skip {row_idx:3}] {str(name)[:25]} ({status_cell.value})')
+                print(f'[skip {row_idx:3}] {str(name)[:25]}')
                 continue
 
-            print(f'\n[{row_idx:3}/{total}] {str(name)[:40]}')
+            print(f'\n[{row_idx:3}/{total}] {str(name)[:45]}')
+            print(f'  標題: {str(title)[:30] if title else "（空）"}')
+            print(f'  文案: {str(copy_text)[:30] if copy_text else "（空）"}')
 
-            status = await process_product(pg, name, link, row_idx)
+            status = await process_product(
+                pg, (name, link, copy_text, title), row_idx)
+
             status_cell.value = status
             wb.save(EXCEL_PATH)
-
             if status == '影片完成': done_count += 1
-
             await asyncio.sleep(random.uniform(1.5, 3.0))
 
         pass  # keep browser open
 
-    print(f'\n{"="*55}')
+    print(f'\n{"="*60}')
     print(f'完成！成功製作 {done_count} 個商品影片')
     print(f'影片存放：{OUTPUT_DIR}')
 
