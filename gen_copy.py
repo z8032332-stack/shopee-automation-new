@@ -40,9 +40,10 @@ COPY_PROMPT = """\
 - 禁用詞：治療、保證、消炎、藥效、永久
 
 【標題規則】
-- 1行，包含2-3個表情符號
+- 1行，不可有任何表情符號或特殊符號
 - 加5-8個 #hashtag（中文關鍵字）
 - 結尾加1句短的商品賣點說明
+- 全部合計不超過140字
 
 【回答格式】（只輸出內容，不要其他說明）
 文案：
@@ -70,6 +71,11 @@ def generate(name):
                 # 清理文案：移除空行、編號
                 lines = [l.strip() for l in copy_raw.splitlines() if l.strip()]
                 copy_part = '\n'.join(lines)
+                # 標題：移除 emoji/特殊符號，截斷至140字
+                import re as _re
+                title_part = _re.sub(r'[\U00010000-\U0010FFFF]', '', title_part)  # 移除 emoji
+                title_part = _re.sub(r'[✨💰🔊🎵🪙✅❌🎯🏆💡🛒🔥⭐️]', '', title_part)  # 常見 emoji
+                title_part = title_part.strip()[:140]
             return copy_part, title_part
         except Exception as e:
             print(f'  [retry {attempt+1}] {e}')
