@@ -196,6 +196,40 @@ content/
 
 ---
 
+## 2026-04-18 今日進度（家裡電腦）
+
+### 環境設定
+- 建立 `.env.home` / `.env.company` 範本，路徑全用環境變數，換電腦只需 `copy .env.home .env`
+- 家裡電腦 Excel：`蝦皮素材\蝦皮選品_2026年 (1).xlsx`
+- 家裡電腦輸出：`蝦皮素材\影片輸出\`（clips）、`蝦皮素材\影片完成\`（成品）
+
+### 抓影片（home3.py）
+- 修正欄位：B品名/C連結/H文案/I標題/J狀態
+- 加 http 跳過非連結列
+- 跑出 13 組 clips（`_clips_001~013`），每組 2-3 支
+
+### 文案生成（gen_copy.py）新增
+- 用 Groq `llama-3.3-70b-versatile` 生成文案+標題
+- 標題：無 emoji、限 140 字
+- 文案：10 句，每句約 10 字（短句版，影片約 15-30 秒）
+- GROQ_KEY 存 `.env`，不上傳 GitHub
+- 成功生成 13 筆，已寫入 Excel H/I 欄
+
+### 後製（shopee_video_producer.py）調整
+- `MIN_CLIPS=1`（最少 1 支即可後製）
+- `fps=24` + `-preset ultrafast`（加速渲染）
+- FFmpeg timeout 120→300 秒（家裡電腦較慢）
+- 寫到 `.tmp.mp4` 再改名，避免毀損
+- `-movflags +faststart`（moov atom 前置，開頭不毀損）
+- **新邏輯**：clip 平均分配時長 = TTS總時長 ÷ clip數（3支→各10秒、2支→各15秒）
+- 今日完成：`002_clear淨洗髮.mp4`（30MB）
+
+### 已知家裡電腦速度
+- 每支影片後製約 30-40 分鐘（公司約 5-8 分鐘）
+- 家裡電腦 CPU 慢，moviepy 渲染很吃重
+
+---
+
 ## 2026-04-08 今日進度
 
 ### 影片上傳
