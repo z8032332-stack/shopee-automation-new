@@ -38,7 +38,7 @@ COL_TITLE  = int(os.getenv('COL_TITLE',  '9'))
 COL_STATUS = int(os.getenv('COL_STATUS', '10'))
 
 # ── 影片參數 ──────────────────────────────────────────────────────────────────
-MIN_CLIPS        = 3
+MIN_CLIPS        = 1  # 後製允許1支以上，不夠長自動循環
 VIDEO_W, VIDEO_H = 1080, 1920
 TTS_VOICE        = os.getenv('TTS_VOICE', 'zh-TW-HsiaoChenNeural')  # 女聲；換男聲用 zh-TW-YunJheNeural
 
@@ -167,13 +167,13 @@ def produce_video(clip_paths, copy_text, output_path):
 
         # ── Step 1: FFmpeg resize 到 1080x1920 ──────────────────────────────
         resized = []
-        for i, src in enumerate(clip_paths[:MIN_CLIPS]):
+        for i, src in enumerate(clip_paths):  # 用全部 clips
             out = os.path.join(tmpdir, f'clip{i:02d}.mp4')
             cmd = [FFMPEG_EXE, '-y', '-i', src,
                    '-vf', (f'scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=decrease,'
                             f'pad={VIDEO_W}:{VIDEO_H}:(ow-iw)/2:(oh-ih)/2:black'),
                    '-c:v', 'libx264', '-an', '-preset', 'fast', '-loglevel', 'error', out]
-            subprocess.run(cmd, capture_output=True, timeout=120)
+            subprocess.run(cmd, capture_output=True, timeout=300)
             if os.path.exists(out):
                 resized.append(out)
 
@@ -255,9 +255,12 @@ def produce_video(clip_paths, copy_text, output_path):
             if mixed_audio:
                 final = final.with_audio(mixed_audio)
 
-            final.write_videofile(output_path, codec='libx264', audio_codec='aac',
-                                  fps=30, logger=None,
-                                  ffmpeg_params=['-loglevel', 'error', '-preset', 'fast'])
+            tmp_path = output_path + '.tmp.mp4'
+            final.write_videofile(tmp_path, codec='libx264', audio_codec='aac',
+                                  fps=24, logger=None,
+                                  ffmpeg_params=['-loglevel', 'error', '-preset', 'ultrafast',
+                                                 '-movflags', '+faststart'])
+            os.replace(tmp_path, output_path)  # 寫完再改名，避免毀損
 
             for c in raw_clips: c.close()
             merged.close()
