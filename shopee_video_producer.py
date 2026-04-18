@@ -193,20 +193,24 @@ def produce_video(clip_paths, copy_text, output_path):
             total_tts_dur = sum(s['duration'] for s in segments)
             log.info('  TTS 總時長 %.1fs', total_tts_dur)
 
-        # ── Step 3: 載入影片，循環補足 TTS 時長 ─────────────────────────────
+        # ── Step 3: 平均分配每支 clip 時長 = TTS總時長 ÷ clip數 ─────────────
         try:
-            raw_clips = [VideoFileClip(p).without_audio() for p in resized]
-            merged    = concatenate_videoclips(raw_clips, method='compose')
-            raw_dur   = merged.duration
+            n_clips    = len(resized)
+            target_dur = total_tts_dur if total_tts_dur > 0 else 20.0
+            per_clip   = target_dur / n_clips  # 每支分到的秒數
 
-            target_dur = max(total_tts_dur + 1.5, raw_dur)  # TTS 結束後留 1.5s
+            fitted = []
+            for p in resized:
+                c = VideoFileClip(p).without_audio()
+                if c.duration < per_clip:
+                    loops = int(per_clip / c.duration) + 1
+                    c = concatenate_videoclips([c] * loops, method='compose')
+                c = c.subclipped(0, per_clip)
+                fitted.append(c)
 
-            if raw_dur < target_dur:
-                loops  = int(target_dur / raw_dur) + 1
-                merged = concatenate_videoclips([merged] * loops, method='compose')
-
-            merged = merged.subclipped(0, target_dur)
+            merged = concatenate_videoclips(fitted, method='compose')
             dur    = merged.duration
+            log.info('  clip分配: %d支 × %.1fs = %.1fs', n_clips, per_clip, dur)
 
         except Exception as e:
             log.error('[video load] %s', e)
