@@ -1,7 +1,9 @@
 # 蝦皮選品影片製作 - Home Computer Version
 # 讀取選品Excel → 抓評論影片 → Gemini篩(無人臉/無開箱) → 合併3支 → 加文案字幕 + BGM → 輸出
 
-import sys, io, asyncio, json, re, os, random, requests, time, tempfile, shutil, glob
+import sys, io, asyncio, json, re, os, random, requests, time, tempfile, shutil, glob, subprocess
+os.environ['PATH'] += os.pathsep + r'C:\ffmpeg\bin'
+os.environ['PATH'] += os.pathsep + r'C:\platform-tools'
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
@@ -17,17 +19,17 @@ import numpy as np
 
 # ── 路徑設定 ──────────────────────────────────────────────────────────────────
 BASE_DIR   = r'C:\Users\user\Desktop\蝦皮自動化工具'
-EXCEL_PATH = os.path.join(BASE_DIR, r'選品Excel\蝦皮關鍵字選品_2026年3-4月.xlsx')
-OUTPUT_DIR = os.path.join(BASE_DIR, '影片輸出')
-BGM_DIR    = os.path.join(BASE_DIR, 'BGM音樂')
+EXCEL_PATH = r'C:\Users\user\Desktop\蝦皮素材\蝦皮關鍵字選品_2026年3-4月new.xlsx'
+OUTPUT_DIR = r'C:\Users\user\Desktop\蝦皮素材\蝦皮影片輸出'
+BGM_DIR    = r'C:\Users\user\Desktop\蝦皮素材\BGM音樂'
 FONT_PATH  = r'C:\Windows\Fonts\msjh.ttc'    # 微軟正黑體（支援繁體中文）
 
 # ── 欄位對應（依照實際Excel）─────────────────────────────────────────────────
-COL_NAME   = 1   # A: 品名
-COL_LINK   = 2   # B: 分潤連結
-COL_COPY   = 7   # G: 文案
-COL_TITLE  = 8   # H: 標題
-COL_STATUS = 9   # I: 狀態  ← 注意是第9欄
+COL_NAME   = 2   # B: 品名
+COL_LINK   = 3   # C: 分潤連結
+COL_COPY   = 8   # H: 文案
+COL_TITLE  = 9   # I: 標題
+COL_STATUS = 10  # J: 狀態
 
 # ── 影片參數 ──────────────────────────────────────────────────────────────────
 MIN_CLIPS    = 3    # 最少幾支影片才合併
@@ -38,10 +40,10 @@ VIDEO_H      = 1920
 
 # ── Gemini 設定 ───────────────────────────────────────────────────────────────
 GEMINI_KEY = 'AIzaSyBfhyW5K3TrNZHs5380tBQ2KjabCmXHtW'
-genai.configure(api_key=GEMINI_KEY, client_options={'api_version': 'v1'})
+genai.configure(api_key=GEMINI_KEY)
 gemini = genai.GenerativeModel(model_name='gemini-1.5-flash')
 
-FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+FFMPEG_EXE = r'C:\ffmpeg\bin\ffmpeg.exe'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 文字工具
@@ -265,15 +267,45 @@ def resize_clip(clip):
     return clip
 
 
+FONT_PATH_FFMPEG = FONT_PATH.replace('\\', '/').replace(':', '\\:')
+
+def build_drawtext(lines, dur):
+    """每句依等分時間顯示，位置在畫面正中央"""
+    if not lines:
+        return ''
+    per = dur / len(lines)
+    parts = []
+    for i, line in enumerate(lines):
+        start = i * per
+        end   = start + per
+        safe  = (line
+                 .replace('\\', '\\\\')
+                 .replace("'",  '\u2019')
+                 .replace(':',  '\\:')
+                 .replace('%',  '\\%'))
+        parts.append(
+            f"drawtext=fontfile='{FONT_PATH_FFMPEG}'"
+            f":text='{safe}'"
+            f":fontcolor=white:fontsize=52"
+            f":x=(w-text_w)/2:y=(h-text_h)/2"
+            f":box=1:boxcolor=black@0.50:boxborderw=14"
+            f":shadowcolor=black@0.8:shadowx=2:shadowy=2"
+            f":enable='between(t,{start:.3f},{end:.3f})'"
+        )
+    return ','.join(parts)
+
+
 def produce_video(clip_paths, title, copy_text, output_path):
     """
-    1. 合併 clip_paths（去音訊）
-    2. 疊上標題（開頭 3 秒）+ 文案（結尾滾動）
+    1. 合併 clip_paths（去音訊）→ 暫存檔
+    2. FFmpeg drawtext 逐句字幕（畫面正中央，每句輪流出現）
     3. 加 BGM
     4. 輸出 mp4
     """
+    import tempfile as tf
+    tmp_merged = output_path + '_merged.mp4'
     try:
-        # 1. 載入並 resize 影片片段
+        # 1. moviepy 合併
         clips = []
         for p in clip_paths[:MIN_CLIPS]:
             c = VideoFileClip(p).without_audio()
@@ -282,54 +314,59 @@ def produce_video(clip_paths, title, copy_text, output_path):
         merged = concatenate_videoclips(clips, method='compose')
         if merged.duration > TARGET_SEC:
             merged = merged.subclipped(0, TARGET_SEC)
-
         dur = merged.duration
 
-        # 2. 文字疊加
-        overlays = [merged]
-
-        if title:
-            title_overlay = make_text_overlay(
-                str(title), VIDEO_W, VIDEO_H, min(3.0, dur),
-                font_size=58, y_pos='top', bg_alpha=180
-            )
-            if title_overlay:
-                overlays.append(title_overlay)
-
-        if copy_text and str(copy_text).strip() not in ('文案', '', 'None'):
-            copy_overlay = make_text_overlay(
-                str(copy_text), VIDEO_W, VIDEO_H, dur,
-                font_size=46, y_pos='bottom', bg_alpha=170
-            )
-            if copy_overlay:
-                overlays.append(copy_overlay)
-
-        final = CompositeVideoClip(overlays, size=(VIDEO_W, VIDEO_H))
-
-        # 3. BGM
-        bgm = get_bgm(dur)
-        if bgm:
-            final = final.with_audio(bgm)
-            print(f'  BGM: 已加入')
-        else:
-            print(f'  BGM: 無音樂（可放 mp3 到 BGM音樂 資料夾）')
-
-        # 4. 輸出
-        final.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            fps=30,
-            logger=None,
-            ffmpeg_params=['-loglevel', 'error', '-preset', 'fast']
+        merged.write_videofile(
+            tmp_merged, codec='libx264', audio=False, fps=30,
+            logger=None, ffmpeg_params=['-loglevel', 'error', '-preset', 'fast']
         )
         for c in clips: c.close()
         merged.close()
-        final.close()
+
+        # 2. FFmpeg 逐句字幕 + BGM
+        lines = [l.strip() for l in str(copy_text or '').split('。') if l.strip()]
+        vf    = build_drawtext(lines, dur) if lines else 'null'
+
+        bgm_files = []
+        for ext in ('*.mp3', '*.wav', '*.m4a', '*.aac'):
+            bgm_files += glob.glob(os.path.join(BGM_DIR, ext))
+
+        if bgm_files:
+            bgm_path = random.choice(bgm_files)
+            cmd = [
+                FFMPEG_EXE, '-y',
+                '-stream_loop', '-1', '-i', tmp_merged,
+                '-stream_loop', '-1', '-i', bgm_path,
+                '-vf', vf,
+                '-filter_complex',
+                f'[1:a]volume=0.15,atrim=0:{dur:.3f}[bgm]',
+                '-map', '0:v', '-map', '[bgm]',
+                '-c:v', 'libx264', '-preset', 'fast',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-t', f'{dur:.3f}',
+                '-loglevel', 'error', output_path
+            ]
+            print(f'  BGM: 已加入')
+        else:
+            cmd = [
+                FFMPEG_EXE, '-y', '-i', tmp_merged,
+                '-vf', vf,
+                '-c:v', 'libx264', '-preset', 'fast', '-an',
+                '-loglevel', 'error', output_path
+            ]
+            print(f'  BGM: 無音樂（可放 mp3 到 BGM音樂 資料夾）')
+
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        if r.returncode != 0:
+            print(f'  [ffmpeg] {r.stderr.decode(errors="ignore")[-500:]}')
+            return False
         return True
     except Exception as e:
         print(f'  [produce] {e}')
         return False
+    finally:
+        if os.path.exists(tmp_merged):
+            os.remove(tmp_merged)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -405,7 +442,8 @@ async def process_product(page, row_data, row_idx):
     if not video_urls:
         return '無評論影片'
 
-    tmpdir = tempfile.mkdtemp()
+    tmpdir = os.path.join(OUTPUT_DIR, f'_clips_{row_idx:03d}')
+    os.makedirs(tmpdir, exist_ok=True)
     valid_clips = []
 
     try:
@@ -437,7 +475,7 @@ async def process_product(page, row_data, row_idx):
             return f'影片不足({len(valid_clips)}/{MIN_CLIPS})'
 
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        pass  # 原始片段保留在 _clips_XXX 資料夾，後製完成後可手動刪除
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
