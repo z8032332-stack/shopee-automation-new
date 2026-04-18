@@ -406,6 +406,8 @@ def main():
             row_idx     = row[0].row - 1
 
             if not name or not link: continue
+            if not str(link).startswith('http'):
+                log.info('[skip %d] 無效連結: %s', row_idx, str(link)[:40]); continue
             if row_idx < START_ROW:
                 log.info('[skip %d] START_ROW=%d，跳過', row_idx, START_ROW); continue
             if status_cell.value and (status_cell.value.startswith('clips_ok') or status_cell.value in ('無評論影片', 'no_videos', 'expired_link')):
