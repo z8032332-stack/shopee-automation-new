@@ -196,6 +196,33 @@ content/
 
 ---
 
+## 2026-04-19 今日進度（家裡電腦）
+
+### 影片上傳
+- **A52s 批次上傳：成功 58 部（含家裡自製 13 部 + 公司影片 45 部）**
+- 家裡自製 Excel：`蝦皮選品_2026年 (1).xlsx`（13筆，001~013）
+- 公司影片 Excel：`蝦皮選品_2026年5月 (1).xlsx`（961筆，篩出 50 部，209~266）
+- 失敗 5 部（213/257/260/261/266）：ADB screencap 超時（手機跑 3 小時後卡住），待補傳
+
+### shopee_upload_a52s.py 修正項目
+- **Video 編號 offset**：檔名用 `excel_row-1` 對應（001開始），非 excel_row
+- **商品搜尋 tab**：新增自動切換至「全部」tab，避免停在「找讚好物」找不到商品
+- **畫質優化**：移至 `skip_editor()` 正確位置（編輯頁右側圖示），搜尋文字或 fallback 座標 (1157,179)
+- **搜尋詞策略**：優先用「品牌+品名 2字」搜尋，失敗再加字重試
+- **A52s profile** 新增座標：`add_product`、`all_categories_tab`、`product_search_box`、`hq_btn`
+
+### add_tts.py 新增
+- 為已完成影片補加 TTS 旁白 + BGM（不重新渲染）
+- 用法：`python add_tts.py 8 13`（指定 Excel row 範圍）
+- 修正 WinError 2：改用單一 asyncio event loop 跑所有 TTS
+
+### 公司影片匯入
+- 從 Google Drive 下載壓縮包（.crdownload → 等下載完 → 解壓縮）
+- 52 部影片（209~266）搬入 `蝦皮素材\影片完成\`
+- .env EXCEL_PATH 更新為 `蝦皮選品_2026年5月 (1).xlsx`
+
+---
+
 ## 2026-04-18 今日進度（家裡電腦）
 
 ### 環境設定
