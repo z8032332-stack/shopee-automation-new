@@ -266,7 +266,7 @@ def produce_video(clip_paths, copy_text, output_path):
                                                  '-movflags', '+faststart'])
             os.replace(tmp_path, output_path)  # 寫完再改名，避免毀損
 
-            for c in raw_clips: c.close()
+            for c in fitted: c.close()
             merged.close()
             if tts_clips:
                 for c in tts_clips: c.close()

@@ -86,7 +86,10 @@ PHONE_PROFILES = {
         "first_video":    (180, 553),    # 3欄 grid 第一格中心（tab底 Y=373，格高 360px）
         "next_btn":       (956, 2180),   # 影片選擇頁「下一步」（UI dump 實測）
         "editor_next":    (934, 2136),   # 編輯頁「下一步」（實測）
-        "add_product":    (540, 1076),   # 發布頁「新增商品」列（估算）
+        "add_product":        (540, 1076),  # 發布頁「新增商品」列（估算）
+        "all_categories_tab": (540, 230),  # 商品搜尋頁「全部分類」tab（待校準）
+        "product_search_box": (700, 130),  # 商品搜尋框
+        "hq_btn":             (1157, 179), # 編輯頁右側「畫質優化」圖示
     },
     # 其他手機（自行填入座標後使用 --phone custom）
     "custom": {
@@ -373,7 +376,7 @@ def select_video_from_gallery(d):
 
 
 def skip_editor(d):
-    """跳過編輯頁，直接下一步"""
+    """跳過編輯頁，直接下一步（先開畫質優化）"""
     print("  跳過編輯頁...")
     time.sleep(4)
     screenshot("editor_page")
@@ -385,6 +388,23 @@ def skip_editor(d):
         print("  ✓ 已在發布頁，無需再點下一步")
         screenshot("after_editor")
         return
+
+    # ── 開啟畫質優化（編輯頁右側圖示）──
+    hq_found = False
+    for _txt in ['畫質優化', '畫質', '高畫質']:
+        _el = d(textContains=_txt)
+        if _el.exists(timeout=2):
+            _el.click()
+            time.sleep(1)
+            print("  ✓ 已開啟畫質優化")
+            hq_found = True
+            break
+    if not hq_found:
+        # React Native fallback：右側第三個圖示座標
+        _hx, _hy = COORD.get("hq_btn", (1157, 179))
+        adb(f"shell input tap {_hx} {_hy}")
+        time.sleep(1)
+        print(f"  → ADB tap 畫質優化 ({_hx},{_hy})")
 
     found = find_and_click(d, ['下一步', '繼續', 'Next'], timeout=3, label="編輯頁下一步")
     if not found:
@@ -620,12 +640,27 @@ def add_product(d, product_name):
             return False
 
     screenshot("add_product_page")
-    # 注意：不切換到「推廣分潤」tab，因為切換後搜尋框會消失
-    # 保持在「找讚好物」tab（預設），搜尋框可見
+
+    # ── 切換到「全部分類」tab（預設在「找讚好物」，找不到分潤商品）──
+    switched_tab = False
+    for _tab_text in ['全部分類', '全部', '所有商品']:
+        _tab = d(textContains=_tab_text)
+        if _tab.exists(timeout=2):
+            _tab.click()
+            print(f"  → 切換 tab：{_tab_text}")
+            time.sleep(1.5)
+            switched_tab = True
+            break
+    if not switched_tab:
+        # React Native fallback：用座標點 tab
+        _tx, _ty = COORD.get("all_categories_tab", (540, 230))
+        print(f"  → ADB tap 全部分類 tab ({_tx},{_ty})")
+        adb(f"shell input tap {_tx} {_ty}")
+        time.sleep(1.5)
+    screenshot("all_categories_tab")
 
     # 商品頁面完全 React Native，uiautomator2 看不到元素
     # 商品頁搜尋框座標（React Native，只能用 ADB 座標）
-    # Y=130：搜尋框在標題下方、tab 上方；X=700：避開放大鏡 icon
     _sx, _sy = COORD.get("product_search_box", (700, 130))
     print(f"  → 點搜尋框 ({_sx},{_sy})")
     adb(f"shell input tap {_sx} {_sy}")
@@ -636,8 +671,8 @@ def add_product(d, product_name):
     search_terms = _build_search_terms(product_name)
 
     for term in search_terms:
-        # 搜尋詞 ≤ 2 個詞時太模糊（只剩品牌名），跳過以免加到錯誤商品
-        if len(term.split()) <= 2:
+        # 搜尋詞只剩 1 個詞時太模糊，跳過
+        if len(term.split()) <= 1:
             print(f"    ⚠ 搜尋詞過短（{term}），跳過以免加錯商品")
             break
 
@@ -731,31 +766,36 @@ def add_product(d, product_name):
 
 
 def _build_search_terms(product_name):
-    """根據品名建立由長到短的搜尋詞"""
+    """根據品名建立由短到長的搜尋詞（品牌+品名優先）"""
     # 去掉 emoji 和特殊符號
     clean = re.sub(r'[^\w\s]', ' ', product_name)
     clean = re.sub(r'\s+', ' ', clean).strip()
     words = clean.split()
 
-    terms = []
-    # 先試前幾個關鍵字組合（跳過太通用的詞如「現貨」「免運」）
+    # 跳過太通用的詞
     skip_words = {'現貨', '免運', '台灣', '出貨', '限時', '特價', '熱賣', '新款',
                    '隔日達', '當日', '預購', '批發', '包郵', '直送', '即日',
-                   '近日', '到貨', '工廠', '直營', '正品', '爆款'}
+                   '近日', '到貨', '工廠', '直營', '正品', '爆款', '全年無休',
+                   '附發票', '免運費'}
     filtered = [w for w in words if w not in skip_words]
 
-    if len(filtered) >= 5:
-        terms.append(' '.join(filtered[:5]))
-    if len(filtered) >= 3:
-        terms.append(' '.join(filtered[:3]))
+    terms = []
+    # 優先用品牌+品名（前2個有意義的詞）
     if len(filtered) >= 2:
         terms.append(' '.join(filtered[:2]))
+    # 再試前3個詞
+    if len(filtered) >= 3:
+        terms.append(' '.join(filtered[:3]))
+    # 再試前4個詞
+    if len(filtered) >= 4:
+        terms.append(' '.join(filtered[:4]))
+    # 最後只用第一個詞（品牌名）
     if len(filtered) >= 1:
         terms.append(filtered[0])
 
     # 如果全部被過濾掉，用原始的
     if not terms and words:
-        terms = [' '.join(words[:3]), words[0]]
+        terms = [' '.join(words[:2]), words[0]]
 
     return terms
 
@@ -867,8 +907,8 @@ def upload_one(row_data, dry_run=False):
     idx = row_data['編號']
     excel_row = row_data['excel_row']  # Excel 行號，對應檔名
     caption = row_data.get('標題', '') or row_data.get('文案', '') or row_data.get('關鍵字文案', '') or ''
-    _matches = glob.glob(os.path.join(VIDEO_DIR, f"{excel_row:03d}_*.mp4"))
-    video_path = _matches[0] if _matches else os.path.join(VIDEO_DIR, f"{excel_row:03d}_final.mp4")
+    _matches = glob.glob(os.path.join(VIDEO_DIR, f"{excel_row-1:03d}_*.mp4"))
+    video_path = _matches[0] if _matches else os.path.join(VIDEO_DIR, f"{excel_row-1:03d}_final.mp4")
     # 用影片檔名的品名做商品搜尋（避免 Excel 新增列後 row 號碼與品名錯位）
     _fname = os.path.basename(video_path)
     _m = re.match(r'^\d+_(.+?)\.mp4$', _fname, re.IGNORECASE)
@@ -1009,7 +1049,7 @@ def main():
         for r in rows:
             if r['excel_row'] < args.start:
                 continue
-            _m = glob.glob(os.path.join(VIDEO_DIR, f"{r['excel_row']:03d}_*.mp4"))
+            _m = glob.glob(os.path.join(VIDEO_DIR, f"{r['excel_row']-1:03d}_*.mp4"))
             video_path = _m[0] if _m else ""
             if video_path and (r.get('標題') or r.get('文案') or r.get('關鍵字文案')):
                 targets.append(r)
