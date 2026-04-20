@@ -38,7 +38,7 @@ COL_TITLE  = int(os.getenv('COL_TITLE',  '9'))
 COL_STATUS = int(os.getenv('COL_STATUS', '10'))
 
 # ── 影片參數 ──────────────────────────────────────────────────────────────────
-MIN_CLIPS        = 3
+MIN_CLIPS        = 1
 VIDEO_W, VIDEO_H = 1080, 1920
 TTS_VOICE        = os.getenv('TTS_VOICE', 'zh-TW-HsiaoChenNeural')  # 女聲；換男聲用 zh-TW-YunJheNeural
 
@@ -56,36 +56,43 @@ def split_sentences(text):
 # ══════════════════════════════════════════════════════════════════════════════
 # TTS 生成
 # ══════════════════════════════════════════════════════════════════════════════
-async def _tts_async(text, path):
-    communicate = edge_tts.Communicate(text, TTS_VOICE)
-    await communicate.save(path)
+async def _tts_one(i, text, path):
+    """單句 TTS，失敗最多重試 3 次"""
+    for attempt in range(3):
+        try:
+            await edge_tts.Communicate(text, TTS_VOICE).save(path)
+            return i, path, True
+        except Exception as e:
+            log.warning('  TTS [%d] 第%d次失敗: %s', i, attempt + 1, e)
+            await asyncio.sleep(1.5 * (attempt + 1))
+    return i, path, False
 
-def generate_tts(text, path):
-    asyncio.run(_tts_async(text, path))
+async def _build_tts_async(sentences, tmpdir):
+    """所有句子同時送出（網路 I/O，不吃 CPU）"""
+    tasks = [
+        _tts_one(i, sent, os.path.join(tmpdir, f'tts_{i:03d}.mp3'))
+        for i, sent in enumerate(sentences)
+    ]
+    return await asyncio.gather(*tasks)
 
 def build_tts_segments(sentences, tmpdir):
     """
-    為每句話生成 TTS MP3，測量時長
+    並行生成所有句 TTS MP3，測量時長
     回傳 list of dict: {text, audio_path, duration}
     """
+    results = asyncio.run(_build_tts_async(sentences, tmpdir))
+    # results 順序與 sentences 一致（gather 保序）
     segments = []
-    for i, sent in enumerate(sentences):
-        mp3_path = os.path.join(tmpdir, f'tts_{i:03d}.mp3')
-        # 重試最多 3 次，每次間隔加長
-        for attempt in range(3):
-            try:
-                time.sleep(0.8 + attempt * 0.5)   # 避免 rate-limit：0.8 / 1.3 / 1.8s
-                generate_tts(sent, mp3_path)
-                clip = AudioFileClip(mp3_path)
-                dur = clip.duration
-                clip.close()
-                segments.append({'text': sent, 'audio': mp3_path, 'duration': dur})
-                log.info('  TTS [%d] %.1fs → %s', i, dur, sent[:30])
-                break
-            except Exception as e:
-                log.warning('  TTS [%d] 第%d次失敗: %s', i, attempt + 1, e)
-                if attempt == 2:
-                    segments.append({'text': sent, 'audio': None, 'duration': 2.5})
+    for i, (_, path, ok) in enumerate(sorted(results, key=lambda x: x[0])):
+        sent = sentences[i]
+        if ok and os.path.exists(path):
+            clip = AudioFileClip(path)
+            dur = clip.duration
+            clip.close()
+            segments.append({'text': sent, 'audio': path, 'duration': dur})
+            log.info('  TTS [%d] %.1fs → %s', i, dur, sent[:30])
+        else:
+            segments.append({'text': sent, 'audio': None, 'duration': 2.5})
     return segments
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,7 +174,7 @@ def produce_video(clip_paths, copy_text, output_path):
 
         # ── Step 1: FFmpeg resize 到 1080x1920 ──────────────────────────────
         resized = []
-        for i, src in enumerate(clip_paths[:MIN_CLIPS]):
+        for i, src in enumerate(clip_paths):
             out = os.path.join(tmpdir, f'clip{i:02d}.mp4')
             cmd = [FFMPEG_EXE, '-y', '-i', src,
                    '-vf', (f'scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=decrease,'
@@ -257,7 +264,7 @@ def produce_video(clip_paths, copy_text, output_path):
 
             final.write_videofile(output_path, codec='libx264', audio_codec='aac',
                                   fps=30, logger=None,
-                                  ffmpeg_params=['-loglevel', 'error', '-preset', 'fast'])
+                                  ffmpeg_params=['-loglevel', 'error', '-preset', 'veryfast'])
 
             for c in raw_clips: c.close()
             merged.close()
@@ -276,6 +283,12 @@ def produce_video(clip_paths, copy_text, output_path):
 # 主程式
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--start', type=int, default=None, help='從第幾列開始（Excel row，含標題行，預設從第2列）')
+    parser.add_argument('--count', type=int, default=None, help='最多後製幾部（預設不限）')
+    args = parser.parse_args()
+
     os.makedirs(FINAL_DIR, exist_ok=True)
 
     wb    = openpyxl.load_workbook(EXCEL_PATH)
@@ -283,14 +296,18 @@ def main():
     total = ws.max_row - 1
     done, fail, skip = 0, 0, 0
 
+    start_row = args.start if args.start else 2
+    max_count = args.count  # None = 不限
+
     print('=' * 55)
     print('蝦皮影片後製 v2（旁白TTS + 逐句字幕）')
     print(f'clips 來源: {CLIPS_DIR}')
     print(f'輸出:       {FINAL_DIR}')
     print(f'TTS 聲音:   {TTS_VOICE}')
+    print(f'起始列: {start_row}，最多後製: {max_count if max_count else "不限"} 部')
     print('=' * 55)
 
-    for row in ws.iter_rows(min_row=2):
+    for row in ws.iter_rows(min_row=start_row):
         row_idx     = row[0].row - 1
         name        = row[COL_NAME   - 1].value
         copy_text   = row[COL_COPY   - 1].value
@@ -301,6 +318,18 @@ def main():
 
         if status_cell.value == '影片完成':
             skip += 1
+            continue
+
+        # 跳過黃色列（品名欄 FFFFFF00 = 直播/垃圾）
+        name_cell = row[COL_NAME - 1]
+        name_fill = name_cell.fill
+        if name_fill and name_fill.fgColor and name_fill.fgColor.type == 'rgb':
+            if name_fill.fgColor.rgb == 'FFFFFF00':
+                skip += 1
+                continue
+
+        # 跳過沒有文案的列（避免產出無旁白影片）
+        if not copy_text:
             continue
 
         clips_folder = os.path.join(CLIPS_DIR, f'_clips_{row_idx:03d}')
@@ -336,6 +365,11 @@ def main():
             log.warning('失敗 #%d', row_idx)
 
         wb.save(EXCEL_PATH)
+
+        # --count 達到上限就停
+        if max_count and done >= max_count:
+            print(f'\n已完成指定數量 {max_count} 部，停止。')
+            break
 
     print(f'\n{"=" * 55}')
     print(f'完成 {done} 個 / 失敗 {fail} 個 / 跳過 {skip} 個')

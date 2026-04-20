@@ -44,7 +44,7 @@ ALL_KEYWORDS = [
     # 季節熱搜
     '雨傘','安全帽','除蟲燈','暖暖包',
 ]
-BLACKLIST  = ['藥','酒','菸','棉花棒','化妝棉']
+BLACKLIST  = ['藥','酒','菸','棉花棒','化妝棉','直播','下單','1元','專拍','鏈接']
 TARGET     = int(os.getenv('KEYWORD_TARGET',    '1000'))
 MIN_SALES  = int(os.getenv('KEYWORD_MIN_SALES', '100'))
 MAX_PER_KW = (TARGET // len(ALL_KEYWORDS)) + 5

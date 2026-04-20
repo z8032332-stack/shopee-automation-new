@@ -250,6 +250,19 @@ def close_all_apps():
         time.sleep(1)
 
 
+def dismiss_popups(d, label=""):
+    """偵測並關閉常見彈窗（優惠券/簽到/廣告等），回傳是否有關閉彈窗"""
+    popup_keywords = ['優惠券', '蝦幣', '簽到', '立即看', '立即領取', '稍後再說', '關閉']
+    for kw in popup_keywords:
+        el = d(textContains=kw)
+        if el.exists(timeout=1):
+            print(f"  [彈窗] 偵測到「{kw}」，按 Back 關閉")
+            adb("shell input keyevent KEYCODE_BACK")
+            time.sleep(1.5)
+            return True
+    return False
+
+
 def find_and_click(d, texts, timeout=5, label="元素"):
     """嘗試多個文字找到並點擊元素，回傳是否成功（優先 textContains）"""
     if isinstance(texts, str):
@@ -339,6 +352,8 @@ def select_video_from_gallery(d):
     screenshot("after_select_video")
 
     print("  下一步（影片預覽）...")
+    # 先關閉可能出現的彈窗（簽到/優惠券等）
+    dismiss_popups(d, label="影片預覽前")
     # 先用文字找（gallery 或 publish page 的元素，timeout 短）
     found = find_and_click(d, ['下一步', '繼續', 'Next'], timeout=3, label="影片預覽下一步")
     if not found:
@@ -347,10 +362,9 @@ def select_video_from_gallery(d):
             el.click()
             found = True
     if not found:
-        # 若在編輯器且工具列可能隱藏：先 tap 影片中心喚醒工具列，再打座標
         screenshot("no_next_btn")
-        print("  → 喚醒工具列後 tap next_btn")
-        adb("shell input tap 540 1000")  # 喚醒工具列
+        print("  → 再次嘗試關閉彈窗後 tap next_btn")
+        dismiss_popups(d, label="next_btn前二次")
         time.sleep(1)
         adb(f"shell input tap {COORD['next_btn'][0]} {COORD['next_btn'][1]}")
         time.sleep(3)
@@ -828,11 +842,12 @@ def handle_upload_failure(d, max_retries=3):
             tap(*COORD["shortvideo_tab"], wait=5)
 
             # 等待上傳完成
-            for i in range(30):  # 最多等 60 秒
+            for i in range(150):  # 最多等 300 秒（5分鐘）
                 time.sleep(2)
                 uploading = d(textContains='上傳中')
                 if uploading.exists:
-                    print(f"    上傳中...")
+                    if i % 15 == 0:
+                        print(f"    上傳中... ({i*2}s)")
                     continue
                 fail2 = d(textContains='上傳失敗')
                 if fail2.exists:
@@ -846,14 +861,30 @@ def handle_upload_failure(d, max_retries=3):
             # 檢查是否正在上傳中
             uploading = d(textContains='上傳中')
             if uploading.exists:
-                print("  上傳中，等待完成...")
-                for i in range(30):
+                print("  上傳中，等待30秒...")
+                for i in range(15):  # 等30秒
                     time.sleep(2)
                     if not d(textContains='上傳中').exists(timeout=2):
                         if not d(textContains='上傳失敗').exists(timeout=2):
                             print("  ✓ 上傳完成！")
                             return True
                         break
+                # 30秒後還在上傳中 → 關分頁重進短影音讓它繼續
+                print("  上傳卡住，關分頁重進短影音...")
+                close_all_apps()
+                time.sleep(2)
+                open_shopee()
+                tap(*COORD["shortvideo_tab"], wait=5)
+                # 再等最多3分鐘
+                for i in range(90):
+                    time.sleep(2)
+                    if not d(textContains='上傳中').exists(timeout=2):
+                        if not d(textContains='上傳失敗').exists(timeout=2):
+                            print("  ✓ 上傳完成！")
+                            return True
+                        break
+                    if i % 15 == 0:
+                        print(f"    等待中... ({i*2}s)")
             else:
                 print("  ✓ 上傳完成！")
                 return True
@@ -961,7 +992,7 @@ def read_excel():
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         data = dict(zip(headers, row))
         if data.get('編號') and data.get('品名'):
-            data['excel_row'] = row_idx  # Excel 行號，對應 row002, row003...
+            data['excel_row'] = row_idx - 1  # 對應後製命名：row[0].row - 1（001, 002...）
             rows.append(data)
     return rows
 
@@ -974,6 +1005,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='跑到發佈前停下')
     parser.add_argument('--start',  type=int,  default=1,          help='從第幾筆開始')
     parser.add_argument('--count',  type=int,  default=50,         help='上傳幾部')
+    parser.add_argument('--gap',    type=int,  default=300,        help='每部之間等待秒數（預設 300 = 5 分鐘）')
     parser.add_argument('--device', type=str,  default=None,        help='手機 IP:PORT（不填則從 profile 自動取得）')
     parser.add_argument('--phone',  type=str,  default="a52s",
                         choices=list(PHONE_PROFILES.keys()),
@@ -1040,6 +1072,11 @@ def main():
                 close_all_apps()
             except:
                 pass
+
+        # 每部之間等待（避免蝦皮偵測頻繁上傳）
+        if i < len(targets) - 1 and args.gap > 0:
+            print(f"  ⏳ 等待 {args.gap} 秒再上傳下一部...")
+            time.sleep(args.gap)
 
     print(f"\n{'='*50}")
     print(f"📊 結果: 成功 {success_count} / 失敗 {fail_count} / 總共 {len(targets)}")
