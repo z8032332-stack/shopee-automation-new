@@ -13,6 +13,8 @@ from groq import Groq
 
 EXCEL_PATH = os.getenv('EXCEL_PATH', r'C:\Users\user\Desktop\蝦皮素材\蝦皮選品_2026年 (1).xlsx')
 GROQ_KEY   = os.getenv('GROQ_KEY', '')
+START_ROW  = int(os.getenv('START_ROW', '1'))
+END_ROW    = int(os.getenv('END_ROW',   '99999'))
 
 COL_NAME   = 2   # B
 COL_LINK   = 3   # C
@@ -98,6 +100,11 @@ def main():
 
         if not name or not link: continue
         if not str(link).startswith('http'): continue
+        item_no = row_idx - 1  # Excel row 2 = 編號 1
+        if item_no < START_ROW:
+            print(f'[skip {row_idx}] 編號{item_no} < 起始{START_ROW}'); continue
+        if item_no > END_ROW:
+            print(f'[stop] 編號{item_no} > 結束{END_ROW}，停止'); break
         if copy_cell.value:  # 已有文案就跳過
             print(f'[skip {row_idx}] 已有文案')
             continue

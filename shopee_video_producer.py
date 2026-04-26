@@ -36,6 +36,8 @@ COL_NAME   = int(os.getenv('COL_NAME',   '2'))
 COL_COPY   = int(os.getenv('COL_COPY',   '8'))
 COL_TITLE  = int(os.getenv('COL_TITLE',  '9'))
 COL_STATUS = int(os.getenv('COL_STATUS', '10'))
+START_ROW  = int(os.getenv('START_ROW',  '1'))
+END_ROW    = int(os.getenv('END_ROW',    '99999'))
 
 # ── 影片參數 ──────────────────────────────────────────────────────────────────
 MIN_CLIPS        = 1  # 後製允許1支以上，不夠長自動循環
@@ -305,6 +307,11 @@ def main():
 
         if not name:
             continue
+
+        if row_idx < START_ROW:
+            skip += 1; continue
+        if row_idx > END_ROW:
+            print(f'[stop] 編號{row_idx} > 結束{END_ROW}，停止'); break
 
         if status_cell.value == '影片完成':
             skip += 1

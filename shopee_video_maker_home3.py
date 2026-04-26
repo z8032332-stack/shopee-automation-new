@@ -40,6 +40,7 @@ COL_STATUS = int(os.getenv('COL_STATUS', '10'))  # J: 狀態
 
 # ── 從哪列開始（.env 設 START_ROW=22 就從第22筆繼續）──────────────────────────
 START_ROW = int(os.getenv('START_ROW', '1'))
+END_ROW   = int(os.getenv('END_ROW',   '99999'))
 
 # ── 影片參數（沿用 original skill）────────────────────────────────────────────
 MIN_CLIPS        = 3    # 最少 3 支才合併
@@ -153,14 +154,38 @@ def get_review_video_urls(driver, product_url):
     """navigate to product page + fetch ratings（沿用 original skill）"""
     # 先導覽到短網址，讓瀏覽器跟著跳轉到真實商品頁，再抓 shopid/itemid
     log.info('Opening: %s', product_url)
-    driver.get(str(product_url))
+    try:
+        driver.set_page_load_timeout(30)
+        driver.get(str(product_url))
+    except Exception:
+        log.warning('頁面載入超時，重置瀏覽器...')
+        try:
+            driver.set_page_load_timeout(15)
+            driver.get('about:blank')
+            time.sleep(3)
+        except Exception:
+            pass
+        return [], 'timeout'
     time.sleep(6)
 
-    final_url = driver.current_url
-    log.info('Resolved: %s', final_url)
+    try:
+        final_url = driver.current_url
+    except Exception:
+        log.warning('無法取得目前 URL，跳過')
+        return [], 'timeout'
+    log.info('Resolved: %s', final_url[:80])
 
     if 'buyer/login' in final_url:
         return [], 'login_failed'
+    if 'verify/captcha' in final_url or 'verify/traffic' in final_url:
+        log.warning('CAPTCHA 出現，回主頁冷卻 45 秒...')
+        try:
+            driver.set_page_load_timeout(15)
+            driver.get('https://shopee.tw')
+        except Exception:
+            pass
+        time.sleep(45)
+        return [], 'captcha'
     if 'error_page' in final_url or 'not-found' in final_url:
         return [], 'expired_link'
 
@@ -386,7 +411,7 @@ def main():
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--window-size=1280,900')
     options.add_argument('--lang=zh-TW')
-    driver = uc.Chrome(options=options)
+    driver = uc.Chrome(options=options, version_main=147)
 
     try:
         if not ensure_logged_in(driver):
@@ -410,6 +435,8 @@ def main():
                 log.info('[skip %d] 無效連結: %s', row_idx, str(link)[:40]); continue
             if row_idx < START_ROW:
                 log.info('[skip %d] START_ROW=%d，跳過', row_idx, START_ROW); continue
+            if row_idx > END_ROW:
+                print(f'[stop] 編號{row_idx} > 結束{END_ROW}，停止'); break
             if status_cell.value and (status_cell.value.startswith('clips_ok') or status_cell.value in ('無評論影片', 'no_videos', 'expired_link')):
                 log.info('[skip %d] %s', row_idx, str(name)[:25]); continue
 
@@ -422,7 +449,11 @@ def main():
             log.info('評論影片: %d 個 (%s)', len(video_urls), reason)
 
             if not video_urls:
-                status_cell.value = reason; wb.save(EXCEL_PATH); continue
+                if reason in ('captcha', 'timeout'):
+                    log.warning('[%d] %s，不寫狀態，下次重試', row_idx, reason)
+                else:
+                    status_cell.value = reason; wb.save(EXCEL_PATH)
+                continue
 
             # 下載 + Gemini 過濾 → 直接存到 _clips_XXX 資料夾（不後製）
             clips_dir = os.path.join(OUTPUT_DIR, f'_clips_{row_idx:03d}')
